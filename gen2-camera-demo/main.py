@@ -6,6 +6,8 @@ import depthai as dai
 from time import sleep
 import datetime
 import argparse
+import wls
+import math
 
 '''
 If one or more of the additional depth modes (lrcheck, extended, subpixel)
@@ -49,6 +51,9 @@ parser.add_argument("-manip", "--preview_manip", default=False, action="store_tr
 parser.add_argument("-nn", "--run_nn", const="rgb", choices={"rgb", "left", "right"}, nargs="?",
                     help="Run NN on the selected camera (default: %(const)s)")
 
+parser.add_argument("-hwls", "--hostwls", choices={0, 1}, default=0, type=int,
+                    help="Enable host side WLS.")
+
 args = parser.parse_args()
 
 point_cloud = args.pointcloud  # Create point cloud visualizer. Depends on 'out_rectified'
@@ -57,6 +62,7 @@ enable_rgb = args.enable_rgb
 enable_stereo = not args.no_stereo
 enable_nn = args.run_nn
 if enable_nn == 'rgb': enable_rgb = True
+enable_host_wls = args.hostwls
 
 # StereoDepth config options. TODO move to command line options
 source_camera = not args.static_frames
@@ -90,6 +96,7 @@ print("    Extended disparity:", extended)
 print("    Subpixel:          ", subpixel)
 print("    Median filtering:  ", median)
 print("    Depth output:      ", out_depth)
+print("    Host WLS:          ", enable_host_wls)
 
 # TODO add API to read this from device / calib data
 right_intrinsic = [[860.0, 0.0, 640.0], [0.0, 860.0, 360.0], [0.0, 0.0, 1.0]]
@@ -105,6 +112,10 @@ if point_cloud:
     else:
         print("Disabling point-cloud visualizer, as out_rectified is not set")
 
+if enable_host_wls:
+    wlsFilter = wls.wlsFilter(_lambda=8000, _sigma=1.5)
+    baseline = 75 #mm
+    fov = 71.86
 
 def build_pipeline(pipeline):
     streams = []
@@ -282,12 +293,33 @@ def convert_to_cv2_frame(name, image):
     elif name == 'depth':
         # TODO: this contains FP16 with (lrcheck or extended or subpixel)
         frame = np.array(data).astype(np.uint8).view(np.uint16).reshape((h, w))
+
     elif name == 'disparity':
         frame = np.array(data).astype(np.uint8).view(disp_type).reshape((h, w))
 
         # Compute depth from disparity (32 levels)
         with np.errstate(divide='ignore'):  # Should be safe to ignore div by zero here
             depth = (disp_levels * baseline * focal / frame).astype(np.uint16)
+
+        if enable_host_wls:
+            #grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            focal2 = frame.shape[1] / (2. * math.tan(math.radians(fov / 2)))
+            depthScaleFactor = baseline * focal2
+            filteredDisp, depthFrame = wlsFilter.filter(frame, last_rectif_right, depthScaleFactor)
+            depth = depthFrame
+            depthFrame = cv2.resize(depthFrame, (640,300))
+            cv2.imshow("wls raw depth", depthFrame)
+            filteredDisp = (filteredDisp * (255/(96-1))).astype(np.uint8)
+            filteredDisp = cv2.resize(filteredDisp, (640,300))
+            cv2.imshow(wlsFilter.wlsStream, filteredDisp)
+            coloredDisp = cv2.applyColorMap(filteredDisp, cv2.COLORMAP_HOT)
+            coloredDisp = cv2.resize(coloredDisp, (640,300))
+            cv2.imshow("wls colored disp", coloredDisp)
+
+            depthFrameColor = cv2.normalize(np.clip(depthFrame, 0, 5000), None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8UC1)
+            depthFrameColor = cv2.equalizeHist(depthFrameColor)
+            depthFrameColor = cv2.applyColorMap(depthFrameColor, cv2.COLORMAP_HOT)
+            cv2.imshow("wls colored depth", depthFrameColor)
 
         if 1:  # Optionally, extend disparity range to better visualize it
             frame = (frame * 255. / max_disp).astype(np.uint8)
