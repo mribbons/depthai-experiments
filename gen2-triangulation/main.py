@@ -8,9 +8,44 @@ import depthai as dai
 
 p = dai.Pipeline()
 
+# TODO: Work out how to get this from device in gen2
 left_camera_position = (0.107, -0.038, 0.008)
 right_camera_position = (0.109, 0.039, 0.008)
 cameras = (left_camera_position, right_camera_position)
+
+rotation_matrix = np.array([[0.999956,   -0.008674,   -0.003590],
+    [0.008698,    0.999939,    0.006867],
+    [0.003530,   -0.006898,    0.999970]])
+translation_matrix = np.array([   -7.523639,
+   -0.034132,
+    0.048544,])
+intrinsic_left = np.array([[847.716797,    0.000000,  628.660217],
+    [0.000000,  848.163635,  402.847534],
+    [0.000000,    0.000000,    1.000000]])
+intrinsic_right = np.array([[851.803955,    0.000000,  634.575623],
+    [0.000000,  852.288208,  411.274628],
+    [0.000000,    0.000000,    1.000000,]])
+distortion_left = np.array([-3.567049,   11.420240,    0.000314,   -0.000814,   -8.152797,   -3.640617,   11.683157,
+   -8.406696,    0.000000,    0.000000,    0.000000,    0.000000,    0.000000,    0.000000,])
+distortion_right = np.array([-5.211617,   18.090021,   -0.000381,    0.000292,  -18.919079,   -5.265417,   18.290663,
+  -19.104439,    0.000000,    0.000000,    0.000000,    0.000000,    0.000000,    0.000000,])
+
+R1, R2, projection_left, projection_right, Q, roi1, roi2 = cv2.stereoRectify(intrinsic_left, distortion_left,
+                                                      intrinsic_right, distortion_right,
+                                                      (1280,720),
+                                                      rotation_matrix, translation_matrix)     
+
+
+
+print('stereoRectifyResults')
+print('R1: {}'.format(R1))
+print('R2: {}'.format(R2))
+print('projection_left: {}'.format(projection_left))
+print('projection_right: {}'.format(projection_right))
+print('Q: {}'.format(Q))
+print('roi1: {}'.format(roi1))
+print('roi2: {}'.format(roi2))
+#exit(3)
 
 def populatePipeline(p, name):
     cam = p.create(dai.node.MonoCamera)
@@ -90,6 +125,19 @@ while True:
 populatePipeline(p, "right")
 populatePipeline(p, "left")
 
+def get_landmark_cv2tri(landmark_left, landmark_right):
+    # print('landmark L: {}'.format(landmark_left))
+    # print('landmark R: {}'.format(landmark_right))
+
+    points = []
+
+    for n in range(len(landmark_left)):
+        point_3d = cv2.triangulatePoints(projection_left, projection_right, landmark_left[n-1], landmark_right[n-1])
+        points.append([point_3d[0][0], point_3d[1][0], point_3d[2][0]])
+        # print('point_3d: {}'.format(point_3d))
+
+    return points
+
 def get_landmark_3d(landmark):
     focal_length = 842
     landmark_norm = 0.5 - np.array(landmark)
@@ -126,6 +174,7 @@ with dai.Device(p) as device:
         queues.append(device.getOutputQueue(name="config_"+name, maxSize=4, blocking=False))
     while True:
         lr_landmarks = []
+        landmarks_map = {}
         for i in range(2):
             name = "left" if i == 1 else "right"
             # 300x300 Mono image frame
@@ -153,6 +202,10 @@ with dai.Device(p) as device:
                 landmarks = np.array(landmarks_layer).reshape(5, 2)
 
                 lr_landmarks.append(list(map(get_landmark_3d, landmarks)))
+                landmarks_map[name] = []
+                for n in range(len(landmarks)):
+                    landmarks_map[name].append(landmarks[n-1] * 1000)
+
                 for landmark in landmarks:
                     cv2.circle(cropped_frame, (int(48*landmark[0]), int(48*landmark[1])), 3, (0, 255, 0))
                     w = landmark[0] * width + inConfig.getCropXMin()
@@ -162,6 +215,11 @@ with dai.Device(p) as device:
             # Display both mono/cropped frames
             cv2.imshow("mono_"+name, frame)
             cv2.imshow("crop_"+name, cropped_frame)
+
+        cv2_tri_points = []
+
+        if "left" in landmarks_map and len(landmarks_map["left"]) > 0 and "right" in landmarks_map and len(landmarks_map["right"]) > 0:
+            cv2_tri_points = get_landmark_cv2tri(landmarks_map["left"], landmarks_map["right"])
 
         # 3D visualization
         if len(lr_landmarks) == 2 and len(lr_landmarks[0]) > 0 and len(lr_landmarks[1]) > 0:
@@ -173,7 +231,7 @@ with dai.Device(p) as device:
                                                                     right_camera_position)
                     mid_intersects.append(intersection_landmark)
 
-                start_OpenGL(mid_intersects, cameras, lr_landmarks[0], lr_landmarks[1])
+                start_OpenGL(mid_intersects, cameras, lr_landmarks[0], lr_landmarks[1], cv2_tri_points)
 
         if cv2.waitKey(1) == ord('q'):
             break

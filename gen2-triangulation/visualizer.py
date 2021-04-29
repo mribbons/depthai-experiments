@@ -16,7 +16,7 @@ yRot = 0
 zRot = 0
 
 
-def landmark_visualizer(landmarks, cameras, left_landmarks, right_landmarks):
+def landmark_visualizer(landmarks, cameras, left_landmarks, right_landmarks, cv2_tri_points):
     glLineWidth(1.5)
     glBegin(GL_LINES)
 
@@ -43,6 +43,13 @@ def landmark_visualizer(landmarks, cameras, left_landmarks, right_landmarks):
     glColor3f(1.0, 0.0, 0.0)
     for i in range(len(cameras)):
         glVertex3f(cameras[i][0], cameras[i][1], cameras[i][2])
+    glEnd()
+
+    glPointSize(3.0)
+    glBegin(GL_POINTS)
+    glColor3f(1.0, 1.0, 0.0)
+    for i in range(len(cv2_tri_points)):
+        glVertex3f(cv2_tri_points[i][0], cv2_tri_points[i][1], cv2_tri_points[i][2])
     glEnd()
 
     glLineWidth(1.5)
@@ -120,7 +127,7 @@ def initialize_OpenGL():
     glTranslatef(0.0, 0.0, -5)
 
 
-def start_OpenGL(landmarks, cameras, left_landmarks, right_landmarks):
+def start_OpenGL(landmarks, cameras, left_landmarks, right_landmarks, points):
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             pygame.quit()
@@ -128,7 +135,7 @@ def start_OpenGL(landmarks, cameras, left_landmarks, right_landmarks):
         mouseMove(event)
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-    landmark_visualizer(landmarks, cameras, left_landmarks, right_landmarks)
+    landmark_visualizer(landmarks, cameras, left_landmarks, right_landmarks, points)
     pygame.display.flip()
     pygame.time.wait(1)
 
