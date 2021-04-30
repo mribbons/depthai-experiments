@@ -9,12 +9,14 @@ import numpy as np
 from imutils.video import FPS
 
 # usage for 3d visualisation: python main.py -cam -vis
+# Be sure to install local requirements
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-nd', '--no-debug', action="store_true", help="Prevent debug output")
 parser.add_argument('-cam', '--camera', action="store_true", help="Use DepthAI 4K RGB camera for inference (conflicts with -vid)")
 parser.add_argument('-vid', '--video', type=str, help="Path to video file to be used for inference (conflicts with -cam)")
 parser.add_argument('-vis', '--visualizer', action="store_true", help="Use 3d vizualizer")
+parser.add_argument('-tri', '--use_triangulation', action="store_true", help="Use triangulation to get 3d point locations (Disables RGB)")
 
 def setup_camera_params():
     # TODO: Work out how to get this from device in gen2
@@ -143,7 +145,7 @@ def create_pipeline(use_rgb):
         pose_nn.input.setQueueSize(1)
         pose_nn.input.setBlocking(False)
         pose_nn_xout = pipeline.createXLinkOut()
-        pose_nn_xout.setStreamName("pose_nn")
+        pose_nn_xout.setStreamName("pose_nn_rgb")
         pose_nn.out.link(pose_nn_xout.input)
 
         if args.camera:
@@ -261,14 +263,14 @@ def pose_thread(in_queue, cam, once=False):
         if once:
             break
 
-use_rgb = False 
+use_rgb = not args.use_triangulation
 with dai.Device(create_pipeline(use_rgb)) as device:
     print("Starting pipeline...")
     device.startPipeline()
     cam_out = []
     if args.camera:
         if use_rgb:
-            cam_out.append(getOutputQueue("cam_out", 1, False))
+            cam_out.append(device.getOutputQueue("cam_out", 1, False))
             controlQueue = device.getInputQueue('control')
         else:
             cam_out.append(device.getOutputQueue("mono_left", 1, False))
@@ -278,7 +280,7 @@ with dai.Device(create_pipeline(use_rgb)) as device:
 
     cams = []
     if use_rgb:
-        cams = [""]
+        cams = ["rgb"]
     else: 
         cams = ["left", "right"]
 
@@ -421,7 +423,8 @@ with dai.Device(create_pipeline(use_rgb)) as device:
                     if cam in keypoints_list and keypoints_list[cam] is not None and detected_keypoints[cam] is not None and personwiseKeypoints[cam] is not None:
                         for i in range(18):
                             for j in range(len(detected_keypoints[cam][i])):
-                                cv2.circle(debug_frame, detected_keypoints[cam][i][j][0:2], 5, colors[i], -1, cv2.LINE_AA)
+                                if j < len(detected_keypoints[cam][i]): # Fix list index out of range error, not 100% on cause yet
+                                    cv2.circle(debug_frame, detected_keypoints[cam][i][j][0:2], 5, colors[i], -1, cv2.LINE_AA)
                         for i in range(17):
                             for n in range(len(personwiseKeypoints[cam])):
                                 try:
