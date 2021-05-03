@@ -11,12 +11,20 @@ from imutils.video import FPS
 # usage for 3d visualisation: python main.py -cam -vis
 # Be sure to install local requirements
 
+OPENCV_OBJECT_TRACKERS = {
+    "csrt": cv2.TrackerCSRT_create,
+    "kcf": cv2.TrackerKCF_create,
+    "mil": cv2.TrackerMIL_create
+}
+
 parser = argparse.ArgumentParser()
 parser.add_argument('-nd', '--no-debug', action="store_true", help="Prevent debug output")
 parser.add_argument('-cam', '--camera', action="store_true", help="Use DepthAI 4K RGB camera for inference (conflicts with -vid)")
 parser.add_argument('-vid', '--video', type=str, help="Path to video file to be used for inference (conflicts with -cam)")
 parser.add_argument('-vis', '--visualizer', action="store_true", help="Use 3d vizualizer")
 parser.add_argument('-tri', '--use_triangulation', action="store_true", help="Use triangulation to get 3d point locations (Disables RGB)")
+parser.add_argument('-tra', '--tracker', const="kcf", choices=OPENCV_OBJECT_TRACKERS, help="Object tracking algorithm (default: %(const)s)", nargs="?")
+
 
 def setup_camera_params():
     # TODO: Work out how to get this from device in gen2
@@ -80,7 +88,7 @@ def populatePipeline(p, name):
     socket = dai.CameraBoardSocket.LEFT if name == "left" else dai.CameraBoardSocket.RIGHT
     cam.setBoardSocket(socket)
     cam.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-    cam.setFps(20.0)
+    #cam.setFps(30.0)
 
     # ImageManip for cropping (face detection NN requires input image of 300x300) and to change frame type
     pose_manip = p.create(dai.node.ImageManip)
@@ -98,7 +106,7 @@ def populatePipeline(p, name):
     # Send mono frames to the host via XLink
     cam_xout = p.create(dai.node.XLinkOut)
     cam_xout.setStreamName("mono_" + name)
-    #cam.out.link(cam_xout.input)
+    cam.out.link(cam_xout.input)
     #pose_nn.out.link(cam_xout.input)
     
     
@@ -108,7 +116,7 @@ def populatePipeline(p, name):
     pose_nn_xout = p.createXLinkOut()
     pose_nn_xout.setStreamName("pose_nn_{}".format(name))
     pose_nn.out.link(pose_nn_xout.input)
-    pose_nn.passthrough.link(cam_xout.input)
+    # pose_nn.passthrough.link(cam_xout.input)
 
 
 def create_pipeline(use_rgb):
@@ -218,13 +226,17 @@ else:
     cap = cv2.VideoCapture(str(Path(args.video).resolve().absolute()))
     fps = FPSHandler(cap)
 
+trackers = {}
 
 def pose_thread(in_queue, cam, once=False):
     global keypoints_list, detected_keypoints, personwiseKeypoints
-
+    global trackers
+    global frame_counter, last_pose_frame
+    
     while running:
         try:
             raw_in = in_queue.get()
+            
         except RuntimeError as e:
             print('raw in error: {}'.format(e))
             return
@@ -258,11 +270,90 @@ def pose_thread(in_queue, cam, once=False):
         newPersonwiseKeypoints = getPersonwiseKeypoints(valid_pairs, invalid_pairs, new_keypoints_list)
 
         detected_keypoints[cam], keypoints_list[cam], personwiseKeypoints[cam] = (new_keypoints, new_keypoints_list, newPersonwiseKeypoints)
-        #time.sleep(1)
+        last_pose_frame = frame_counter
+        time.sleep(0.5)
+        
+        if cam in trackers:
+            trackers[cam] = {}
 
         if once:
             break
 
+def triangulate_keypoints(run_once=False):
+    global keypoints_list, detected_keypoints, personwiseKeypoints
+    global geom_queue
+    global frame_counter, last_triangulated_frame, last_pose_frame
+
+    last_triangulated_frame = 0
+
+    while running:
+        if last_pose_frame != last_triangulated_frame and 'left' in keypoints_list and 'right' in keypoints_list:
+            last_triangulated_frame = frame_counter
+            geom_points = []
+            geom_lines = []
+            for i in range(18):
+                for j in range(len(detected_keypoints[cam][i])):
+                    if j < len(detected_keypoints[cam][i]): # Fix list index out of range error, not 100% on cause yet
+                        cv2.circle(debug_frame, detected_keypoints[cam][i][j][0:2], 5, colors[i], -1, cv2.LINE_AA)
+
+                    try:
+                        point_3d = cv2.triangulatePoints(projection_left, projection_right, detected_keypoints['left'][i][j][0:2], detected_keypoints['right'][i][j][0:2])
+                        geom_points.append([point_3d[0][0], point_3d[1][0], point_3d[2][0], colors[i][2], colors[i][1], colors[i][0]])
+                        # print(detected_keypoints['left'][i][j][0:2])
+                        # print(geom_points[-1])
+                    except Exception as e:
+                        pass
+                        #print('triangulate error: {}'.format(e))
+
+                for i in range(17):
+                    for n in range(len(personwiseKeypoints['left'])):
+                        points_L = None
+                        points_R = None
+                        try:
+                            index = personwiseKeypoints['left'][n][np.array(POSE_PAIRS[i])]
+                            index2 = personwiseKeypoints['right'][n][np.array(POSE_PAIRS[i])]
+                            if -1 in index or -1 in index2:
+                                continue
+
+                            B = np.int32(keypoints_list['left'][index.astype(int), 0])
+                            A = np.int32(keypoints_list['left'][index.astype(int), 1])
+                            points_L_1 = np.float32([B[0], A[0]])
+                            points_L_2 = np.float32([B[1], A[1]])
+                            
+                            B = np.int32(keypoints_list['right'][index2.astype(int), 0])
+                            A = np.int32(keypoints_list['right'][index2.astype(int), 1])
+                            points_R_1 = np.float32([B[0], A[0]])
+                            points_R_2 = np.float32([B[1], A[1]])
+                            got_points = True
+                        except Exception as e:
+                            got_points = False
+                            #pass # Ignore concurrency issues issues
+
+                        try:
+                            if got_points:
+                                point_a = cv2.triangulatePoints(projection_left, projection_right, points_L_1, points_R_1)
+                                point_b = cv2.triangulatePoints(projection_left, projection_right, points_L_2, points_R_2)
+
+                                #cv2.line(debug_frame, (B[0], A[0]), (B[1], A[1]), colors[i], 3, cv2.LINE_AA)
+                                geom_lines.append([point_a[0][0], point_a[1][0], point_a[2][0], point_b[0][0], point_b[1][0], point_b[2][0], colors[i][2], colors[i][1], colors[i][0]])
+                                #print((B_L[0], B_L[1]),  A_L)
+                                #print(geom_lines[-1])
+                            #exit(0)
+                        except Exception as e:
+                            print('triangulate lines error: {}'.format(e))
+                            #pass # Need to do some locking or add additional checks
+
+            geom_queue.append([geom_points, geom_lines])
+        if run_once:
+            break
+
+        time.sleep(0.0333)
+
+geom_queue = []
+geom_last_triangulate = -1
+frame_counter = 0
+last_triangulated_frame = None
+last_pose_frame = None
 use_rgb = not args.use_triangulation
 with dai.Device(create_pipeline(use_rgb)) as device:
     print("Starting pipeline...")
@@ -285,6 +376,7 @@ with dai.Device(create_pipeline(use_rgb)) as device:
         cams = ["left", "right"]
 
     pose_queues = []
+    threads = []
 
     for cam in cams:
         if len(cam) > 0:
@@ -295,68 +387,12 @@ with dai.Device(create_pipeline(use_rgb)) as device:
         pose_queues.append(device.getOutputQueue("pose_nn_{}".format(cam), 1, False))    
         
         #pose_nn = device.getOutputQueue("pose_nn{}".format(cam_suffixed), 1, False)
-        t = threading.Thread(target=pose_thread, args=(pose_queues[-1], cam, False))
-        t.start()
+        threads.append(threading.Thread(target=pose_thread, args=(pose_queues[-1], cam, False)))
+        threads[-1].start()
 
-    def triangulate_keypoints():
-        global keypoints_list, detected_keypoints, personwiseKeypoints
-        geom_points = []
-        geom_lines = []
-
-        for i in range(18):
-            for j in range(len(detected_keypoints[cam][i])):
-                cv2.circle(debug_frame, detected_keypoints[cam][i][j][0:2], 5, colors[i], -1, cv2.LINE_AA)
-
-                try:
-                    point_3d = cv2.triangulatePoints(projection_left, projection_right, detected_keypoints['left'][i][j][0:2], detected_keypoints['right'][i][j][0:2])
-                    geom_points.append([point_3d[0][0], point_3d[1][0], point_3d[2][0], colors[i][0], colors[i][1], colors[i][2]])
-                    # print(detected_keypoints['left'][i][j][0:2])
-                    # print(geom_points[-1])
-                except Exception as e:
-                    pass
-                    #print('triangulate error: {}'.format(e))
-
-            for i in range(17):
-                for n in range(len(personwiseKeypoints['left'])):
-                    points_L = None
-                    points_R = None
-                    try:
-                        index = personwiseKeypoints['left'][n][np.array(POSE_PAIRS[i])]
-                        index2 = personwiseKeypoints['right'][n][np.array(POSE_PAIRS[i])]
-                        if -1 in index or -1 in index2:
-                            continue
-
-                        B = np.int32(keypoints_list['left'][index.astype(int), 0])
-                        A = np.int32(keypoints_list['left'][index.astype(int), 1])
-                        points_L_1 = np.float32([B[0], A[0]])
-                        points_L_2 = np.float32([B[1], A[1]])
-                        
-                        B = np.int32(keypoints_list['right'][index2.astype(int), 0])
-                        A = np.int32(keypoints_list['right'][index2.astype(int), 1])
-                        points_R_1 = np.float32([B[0], A[0]])
-                        points_R_2 = np.float32([B[1], A[1]])
-                        got_points = True
-                    except Exception as e:
-                        got_points = False
-                        #pass # Ignore concurrency issues issues
-
-                    try:
-                        if got_points:
-                            point_a = cv2.triangulatePoints(projection_left, projection_right, points_L_1, points_R_1)
-                            point_b = cv2.triangulatePoints(projection_left, projection_right, points_L_2, points_R_2)
-
-                            #cv2.line(debug_frame, (B[0], A[0]), (B[1], A[1]), colors[i], 3, cv2.LINE_AA)
-                            geom_lines.append([point_a[0][0], point_a[1][0], point_a[2][0], point_b[0][0], point_b[1][0], point_b[2][0], colors[i][0], colors[i][1], colors[i][2]])
-                            #print((B_L[0], B_L[1]),  A_L)
-                            #print(geom_lines[-1])
-                        #exit(0)
-                    except Exception as e:
-                        print('triangulate lines error: {}'.format(e))
-                        #pass # Need to do some locking or add additional checks
-
-
-        if args.visualizer:
-            start_OpenGL(geom_points, geom_lines)
+    if args.use_triangulation:
+        threads.append(threading.Thread(target=triangulate_keypoints, args=()))
+        threads[-1].start()
 
     def should_run():
         return cap.isOpened() if args.video else True
@@ -389,6 +425,16 @@ with dai.Device(create_pipeline(use_rgb)) as device:
             print("error: ", e)
             exit(1)
 
+    firstFrame = {}
+    trackers = {}
+    tracked_boxes = {}
+    for cam in cams:
+        firstFrame[cam] = True
+        if args.tracker is not None:
+            tracked_boxes[cam] = {}
+            trackers[cam] = {}
+
+    last_geom = [[], []]
 
     try:
         while should_run():
@@ -397,6 +443,7 @@ with dai.Device(create_pipeline(use_rgb)) as device:
             if not read_correctly:
                 break
 
+            frame_counter = frame_counter + 1
             frame = frames[0]
 
             fps.next_iter()
@@ -404,8 +451,12 @@ with dai.Device(create_pipeline(use_rgb)) as device:
             h, w = 256, 456
 
             for x in range(len(cams)):
+                cam = cams[x]
                 frame = frames[x]
-                debug_frame = frame.copy()
+                debug_frame = cv2.resize(frame, (456, 256))
+                if len(debug_frame.shape) < 3:
+                    debug_frame = cv2.cvtColor(debug_frame, cv2.COLOR_GRAY2RGB)
+                
 
                 if not args.camera:
                     nn_data = dai.NNData()
@@ -415,16 +466,48 @@ with dai.Device(create_pipeline(use_rgb)) as device:
                 pose_nn = pose_queues[x]
                 #pose_thread(pose_nn, cams[x], once=True)
 
-                if 'left' in keypoints_list and 'right' in keypoints_list:
-                    triangulate_keypoints()
+                #TODO: reenable, slow. Run threaded.
+                # if args.use_triangulation and 'left' in keypoints_list and 'right' in keypoints_list:
+                #     #threading.Thread(target=triangulate_keypoints, args=()).start()
+                #     triangulate_keypoints()
+
+                if args.visualizer:
+                    if len(geom_queue) > 0:
+                        last_geom = geom_queue.pop()
+
+                    start_OpenGL(*last_geom)                   
 
                 if debug:
-                    cam = cams[x]
+
+                    delete = []
+                    if args.tracker:
+                        temp_trackers = trackers[cam]
+                        for i in temp_trackers.keys():
+                            (success, box) = temp_trackers[i].update(debug_frame)
+                            if success:
+                                (x, y, w1, h1) = [int(v) for v in box]
+                                cv2.rectangle(debug_frame, (x, y), (x + w1, y + h1), (0, 0, 255), 1)
+                            else:
+                                #print("Failed track", i)
+                                pass
+
+                    # for i in delete:
+                    #     del trackers[cam][i]
+
                     if cam in keypoints_list and keypoints_list[cam] is not None and detected_keypoints[cam] is not None and personwiseKeypoints[cam] is not None:
                         for i in range(18):
                             for j in range(len(detected_keypoints[cam][i])):
                                 if j < len(detected_keypoints[cam][i]): # Fix list index out of range error, not 100% on cause yet
                                     cv2.circle(debug_frame, detected_keypoints[cam][i][j][0:2], 5, colors[i], -1, cv2.LINE_AA)
+                                    if args.tracker:
+                                        if i not in trackers[cam]:
+                                            try:
+                                                x, y = detected_keypoints[cam][i][j][0:2]
+                                                trackers[cam][i] = OPENCV_OBJECT_TRACKERS[args.tracker]()                                            
+                                                tracked_boxes[cam][i] = (x - 16, y - 16, 32, 32) # Probably don't need this
+                                                trackers[cam][i].init(debug_frame, tracked_boxes[cam][i])
+                                            except IndexError as e:
+                                                pass
                         for i in range(17):
                             for n in range(len(personwiseKeypoints[cam])):
                                 try:
@@ -440,7 +523,8 @@ with dai.Device(create_pipeline(use_rgb)) as device:
                     cv2.putText(debug_frame, f"NN FPS:  {round(fps.tick_fps('nn'), 1)}", (5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0))
 
 
-                cv2.imshow(cams[x], debug_frame)
+                firstFrame[cam] = False
+                cv2.imshow(cam, debug_frame)
 
                 # for x in range(len(frames)-1):
                 #     cv2.imshow("frame2", frames[x+1])
@@ -461,7 +545,9 @@ with dai.Device(create_pipeline(use_rgb)) as device:
 
     running = False
 
-t.join()
+# for thread in threads:
+#     thread.join()
+
 print("FPS: {:.2f}".format(fps.fps()))
 if not args.camera:
     cap.release()
